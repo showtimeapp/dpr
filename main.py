@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+import requests
 import PyPDF2
 import io
 import numpy as np
@@ -17,13 +17,11 @@ st.set_page_config(
 )
 
 class DPRToTenderConverter:
-    def __init__(self, api_key: str):
-        """Initialize the converter with Gemini API key"""
-        genai.configure(api_key=api_key)
-        self.generation_model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        
-        # For embeddings, we'll use text-embedding-004 model
-        self.embedding_model_name = "text-embedding-004"
+    def __init__(self, gemini_api_key: str, openai_api_key: str = ""):
+        """Initialize the converter with API keys"""
+        self.gemini_api_key = gemini_api_key
+        self.openai_api_key = openai_api_key
+        self.use_openai_embeddings = bool(openai_api_key)
         
     def extract_text_from_pdf(self, pdf_file) -> str:
         """Extract text from uploaded PDF file"""
@@ -67,25 +65,75 @@ class DPRToTenderConverter:
         
         return chunks
     
-    def get_embedding(self, text: str) -> List[float]:
-        """Get embedding for text using Gemini embedding model"""
+    def get_embedding_openai(self, text: str) -> List[float]:
+        """Get embedding using OpenAI API"""
         try:
-            # Use the embed_content function from google.generativeai
-            result = genai.embed_content(
-                model=self.embedding_model_name,
-                content=text,
-                task_type="retrieval_document"
-            )
-            return result['embedding']
+            url = "https://api.openai.com/v1/embeddings"
+            headers = {
+                "Authorization": f"Bearer {self.openai_api_key}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "input": text,
+                "model": "text-embedding-3-large"
+            }
             
+            response = requests.post(url, headers=headers, json=data)
+            if response.status_code == 200:
+                result = response.json()
+                return result['data'][0]['embedding']
+            else:
+                st.warning(f"OpenAI API error: {response.status_code}")
+                return self.get_fallback_embedding(text)
         except Exception as e:
-            st.warning(f"Error generating embedding, using fallback: {str(e)}")
-            # Fallback: create a hash-based embedding
-            text_hash = hash(text)
-            embedding = []
-            for i in range(768):  # Standard embedding size
-                embedding.append((text_hash * (i + 1)) % 1000 / 1000.0)
-            return embedding
+            st.warning(f"OpenAI embedding error: {str(e)}")
+            return self.get_fallback_embedding(text)
+    
+    def get_embedding_gemini(self, text: str) -> List[float]:
+        """Get embedding using Gemini API (REST API)"""
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={self.gemini_api_key}"
+            headers = {"Content-Type": "application/json"}
+            data = {
+                "model": "models/text-embedding-004",
+                "content": {"parts": [{"text": text}]},
+                "taskType": "RETRIEVAL_DOCUMENT"
+            }
+            
+            response = requests.post(url, headers=headers, json=data)
+            if response.status_code == 200:
+                result = response.json()
+                return result['embedding']['values']
+            else:
+                st.warning(f"Gemini embedding API error: {response.status_code}")
+                return self.get_fallback_embedding(text)
+        except Exception as e:
+            st.warning(f"Gemini embedding error: {str(e)}")
+            return self.get_fallback_embedding(text)
+    
+    def get_fallback_embedding(self, text: str) -> List[float]:
+        """Fallback embedding based on text characteristics"""
+        # Create a more sophisticated hash-based embedding
+        words = text.lower().split()
+        embedding = []
+        
+        # Use word statistics to create embedding
+        for i in range(768):
+            if i < len(words):
+                word_hash = hash(words[i]) % 1000
+            else:
+                word_hash = hash(text[i % len(text)]) % 1000
+            
+            embedding.append((word_hash + i * len(text)) % 1000 / 1000.0)
+        
+        return embedding
+    
+    def get_embedding(self, text: str) -> List[float]:
+        """Get embedding for text using available method"""
+        if self.use_openai_embeddings:
+            return self.get_embedding_openai(text)
+        else:
+            return self.get_embedding_gemini(text)
     
     def create_vector_database(self, chunks: List[str]) -> Dict[str, Any]:
         """Create a vector database from chunks using embeddings"""
@@ -93,22 +141,12 @@ class DPRToTenderConverter:
         progress_bar = st.progress(0)
         
         for i, chunk in enumerate(chunks):
-            try:
-                # Get embedding for each chunk
-                result = genai.embed_content(
-                    model=self.embedding_model_name,
-                    content=chunk,
-                    task_type="retrieval_document"
-                )
-                embeddings.append(result['embedding'])
-                
-            except Exception as e:
-                st.warning(f"Error with chunk {i+1}, using fallback embedding")
-                # Use fallback embedding
-                embedding = self.get_embedding(chunk)
-                embeddings.append(embedding)
-            
+            embedding = self.get_embedding(chunk)
+            embeddings.append(embedding)
             progress_bar.progress((i + 1) / len(chunks))
+            
+            # Add small delay to avoid rate limiting
+            time.sleep(0.1)
         
         return {
             'chunks': chunks,
@@ -116,19 +154,29 @@ class DPRToTenderConverter:
         }
     
     def retrieve_relevant_chunks(self, query: str, vector_db: Dict[str, Any], top_k: int = 5) -> List[str]:
-        """Retrieve most relevant chunks for a query using proper embeddings"""
-        try:
-            # Get query embedding
-            result = genai.embed_content(
-                model=self.embedding_model_name,
-                content=query,
-                task_type="retrieval_query"
-            )
-            query_embedding = np.array(result['embedding']).reshape(1, -1)
-            
-        except Exception as e:
-            st.warning(f"Using fallback embedding for query: {str(e)}")
-            query_embedding = np.array(self.get_embedding(query)).reshape(1, -1)
+        """Retrieve most relevant chunks for a query using embeddings"""
+        # Get query embedding (use RETRIEVAL_QUERY task type for Gemini)
+        if self.use_openai_embeddings:
+            query_embedding = np.array(self.get_embedding_openai(query)).reshape(1, -1)
+        else:
+            # For Gemini, use RETRIEVAL_QUERY task type
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={self.gemini_api_key}"
+                headers = {"Content-Type": "application/json"}
+                data = {
+                    "model": "models/text-embedding-004",
+                    "content": {"parts": [{"text": query}]},
+                    "taskType": "RETRIEVAL_QUERY"
+                }
+                
+                response = requests.post(url, headers=headers, json=data)
+                if response.status_code == 200:
+                    result = response.json()
+                    query_embedding = np.array(result['embedding']['values']).reshape(1, -1)
+                else:
+                    query_embedding = np.array(self.get_fallback_embedding(query)).reshape(1, -1)
+            except:
+                query_embedding = np.array(self.get_fallback_embedding(query)).reshape(1, -1)
         
         # Calculate cosine similarity
         similarities = cosine_similarity(query_embedding, vector_db['embeddings'])[0]
@@ -139,7 +187,7 @@ class DPRToTenderConverter:
         return [vector_db['chunks'][i] for i in top_indices]
     
     def generate_scope_of_work(self, relevant_chunks: List[str]) -> str:
-        """Generate Scope of Work using Gemini"""
+        """Generate Scope of Work using Gemini REST API"""
         
         # Combine relevant chunks
         context = "\n\n".join(relevant_chunks)
@@ -163,8 +211,25 @@ Generate a comprehensive Scope of Work document:
 """
         
         try:
-            response = self.generation_model.generate_content(prompt)
-            return response.text
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={self.gemini_api_key}"
+            headers = {"Content-Type": "application/json"}
+            data = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 8192
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json=data)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result['candidates'][0]['content']['parts'][0]['text']
+            else:
+                st.error(f"Gemini API error: {response.status_code} - {response.text}")
+                return "Error generating content. Please check your API key and try again."
+                
         except Exception as e:
             st.error(f"Error generating Scope of Work: {str(e)}")
             return "Error generating content. Please check your API key and try again."
@@ -173,25 +238,45 @@ def main():
     st.title("📋 DPR to Tender Scope of Work Generator")
     st.markdown("Convert your Detailed Project Report (DPR) into a professional Tender Scope of Work document")
     
-    # Sidebar for API key
+    # Sidebar for API keys
     with st.sidebar:
         st.header("Configuration")
-        api_key = st.text_input("Enter Gemini API Key", type="password", help="Get your API key from Google AI Studio")
         
-        if api_key:
-            st.success("API Key configured!")
-            st.info("Using Models:")
-            st.write("• **Embedding**: text-embedding-004")
-            st.write("• **Generation**: gemini-2.0-flash-exp")
+        # Gemini API Key (Required)
+        gemini_api_key = st.text_input(
+            "Enter Gemini API Key", 
+            type="password", 
+            help="Get your API key from Google AI Studio"
+        )
+        
+        # OpenAI API Key (Optional)
+        st.subheader("Optional: Better Embeddings")
+        openai_api_key = st.text_input(
+            "OpenAI API Key (Optional)", 
+            type="password", 
+            help="For better embeddings. Leave empty to use Gemini embeddings."
+        )
+        
+        if gemini_api_key:
+            st.success("✅ Gemini API Key configured!")
+            if openai_api_key:
+                st.success("✅ OpenAI API Key configured!")
+                st.info("Using:")
+                st.write("• **Embedding**: OpenAI text-embedding-3-large")
+                st.write("• **Generation**: Gemini 2.0 Flash")
+            else:
+                st.info("Using:")
+                st.write("• **Embedding**: Gemini text-embedding-004")
+                st.write("• **Generation**: Gemini 2.0 Flash")
         else:
             st.warning("Please enter your Gemini API key to continue")
     
-    if not api_key:
+    if not gemini_api_key:
         st.info("👈 Please enter your Gemini API key in the sidebar to get started")
         return
     
     # Initialize converter
-    converter = DPRToTenderConverter(api_key)
+    converter = DPRToTenderConverter(gemini_api_key, openai_api_key)
     
     # File upload
     st.header("📁 Upload DPR Document")
@@ -229,19 +314,59 @@ def main():
                 # Step 5: Retrieve relevant chunks
                 st.info("Step 5: Retrieving relevant information...")
                 
-                # Define scope of work queries
-                sow_queries = [
-                    "scope of work deliverables and responsibilities",
-                    "technical requirements and specifications",
-                    "project objectives and implementation plan",
-                    "construction activities and installation requirements",
-                    "milestones timeline and completion criteria"
+                # Define comprehensive scope of work queries based on your document
+                core_keywords = [
+                    "scope of work",
+                    "statement of work", 
+                    "project scope",
+                    "deliverables",
+                    "work breakdown structure",
+                    "responsibilities",
+                    "technical requirements",
+                    "implementation plan",
+                    "construction activities",
+                    "installation requirements",
+                    "execution methodology",
+                    "bill of quantities"
                 ]
                 
+                contextual_keywords = [
+                    "project objectives",
+                    "technical specifications",
+                    "schedule of work",
+                    "milestones",
+                    "phasing plan", 
+                    "construction schedule",
+                    "operational requirements",
+                    "design requirements",
+                    "execution plan",
+                    "site preparation",
+                    "installation works",
+                    "completion criteria",
+                    "handover requirements"
+                ]
+                
+                semantic_queries = [
+                    "Extract all details describing the scope of work for this project",
+                    "What tasks and deliverables are expected from the contractor?",
+                    "Summarize the technical and operational requirements for execution",
+                    "Describe the methodology for executing this project",
+                    "List all milestones and timelines for completion",
+                    "Identify all deliverables and outputs required by the contractor",
+                    "Summarize all installation, testing, and commissioning requirements",
+                    "Outline all responsibilities and obligations of the contractor"
+                ]
+                
+                # Combine all query types
+                all_queries = core_keywords + contextual_keywords + semantic_queries
+                
                 all_relevant_chunks = []
-                for query in sow_queries:
-                    relevant_chunks = converter.retrieve_relevant_chunks(query, vector_db, top_k=3)
+                progress_retrieval = st.progress(0)
+                
+                for i, query in enumerate(all_queries):
+                    relevant_chunks = converter.retrieve_relevant_chunks(query, vector_db, top_k=2)
                     all_relevant_chunks.extend(relevant_chunks)
+                    progress_retrieval.progress((i + 1) / len(all_queries))
                 
                 # Remove duplicates while preserving order
                 seen = set()
@@ -253,7 +378,12 @@ def main():
                 
                 # Step 6: Generate Scope of Work
                 st.info("Step 6: Generating Scope of Work document...")
-                scope_of_work = converter.generate_scope_of_work(unique_chunks[:10])  # Limit to top 10 chunks
+                
+                # Use top chunks (limit to prevent token overflow)
+                top_chunks = unique_chunks[:15]  # Increased from 10 to 15 for better coverage
+                
+                st.info(f"Using {len(top_chunks)} most relevant chunks for generation...")
+                scope_of_work = converter.generate_scope_of_work(top_chunks)
             
             st.success("✅ Scope of Work generated successfully!")
             
@@ -271,7 +401,9 @@ def main():
                 st.metric("Original Text Length", f"{len(raw_text):,} chars")
                 st.metric("Cleaned Text Length", f"{len(cleaned_text):,} chars")
                 st.metric("Text Chunks Created", len(chunks))
-                st.metric("Relevant Chunks Used", len(unique_chunks[:10]))
+                st.metric("Total Queries Processed", len(all_queries))
+                st.metric("Relevant Chunks Found", len(unique_chunks))
+                st.metric("Top Chunks Used", len(top_chunks))
                 
                 # Download button
                 st.download_button(
@@ -281,13 +413,32 @@ def main():
                     mime="text/plain"
                 )
             
+            # Show retrieval statistics
+            with st.expander("📊 Retrieval Query Statistics"):
+                st.subheader("Query Categories Used:")
+                st.write(f"**Core Keywords**: {len(core_keywords)} queries")
+                st.write(f"**Contextual Keywords**: {len(contextual_keywords)} queries") 
+                st.write(f"**Semantic Queries**: {len(semantic_queries)} queries")
+                st.write(f"**Total Queries**: {len(all_queries)}")
+                st.write(f"**Unique Chunks Retrieved**: {len(unique_chunks)}")
+                
+                # Show sample queries
+                st.subheader("Sample Queries Used:")
+                sample_queries = [
+                    "Core: " + core_keywords[0],
+                    "Contextual: " + contextual_keywords[0], 
+                    "Semantic: " + semantic_queries[0]
+                ]
+                for query in sample_queries:
+                    st.write(f"• {query}")
+            
             # Show preview of extracted text
             with st.expander("📖 Preview Extracted Text (First 1000 characters)"):
                 st.text(cleaned_text[:1000] + "..." if len(cleaned_text) > 1000 else cleaned_text)
             
             # Show chunks used
-            with st.expander("🔍 Relevant Chunks Used"):
-                for i, chunk in enumerate(unique_chunks[:5], 1):
+            with st.expander("🔍 Top Relevant Chunks Used"):
+                for i, chunk in enumerate(top_chunks[:5], 1):
                     st.subheader(f"Chunk {i}")
                     st.text(chunk[:300] + "..." if len(chunk) > 300 else chunk)
 
