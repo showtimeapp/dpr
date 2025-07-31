@@ -203,6 +203,7 @@ Your task:
 3. Use formal tender language suitable for a government infrastructure project
 4. Remove irrelevant details or repeated points
 5. Ensure that the final text can be directly inserted into a tender document
+6. Give the Timeline with correct expected number as per your Knowledge ,do not simply write x,y,z or to be specified 
 
 Retrieved text:
 {context}
