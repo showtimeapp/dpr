@@ -1,0 +1,6 @@
+streamlit==1.29.0
+google-generativeai
+PyPDF2==3.0.1
+numpy
+scikit-learn
+python-dotenv==1.0.0
